@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"net"
@@ -19,55 +20,168 @@ type Config struct {
 	EndPort     int
 	Threads     int
 	Timeout     time.Duration
-	Verbose     bool
+	IsCIDR      bool
 }
 
 // Result holds the scan result for a specific port
-type Result struct {
+type PortResult struct {
 	Port    int
 	State   string
 	Service string
 	Banner  string
 }
 
+// HostResult holds the result for host discovery
+type HostResult struct {
+	IP     string
+	Status string
+}
+
 func main() {
 	// 1. Parse Command Line Arguments
-	targetPtr := flag.String("target", "127.0.0.1", "Target IP or Hostname")
-	rangePtr := flag.String("ports", "1-1024", "Port range to scan (e.g., 1-65535)")
+	targetPtr := flag.String("target", "127.0.0.1", "Target IP (e.g., 192.168.1.1) or CIDR (e.g., 192.168.1.0/24)")
+	rangePtr := flag.String("ports", "1-1024", "Port range for Port Scan Mode (e.g., 1-65535)")
 	threadsPtr := flag.Int("threads", 100, "Number of concurrent workers")
-	timeoutPtr := flag.Int("timeout", 2000, "Timeout per port in milliseconds")
+	timeoutPtr := flag.Int("timeout", 1000, "Timeout in milliseconds") // Reduced default for faster host discovery
 	flag.Parse()
 
-	// 2. Process Port Range
-	startPort, endPort, err := parsePortRange(*rangePtr)
+	// 2. Determine Mode (Host Discovery vs Port Scan)
+	isCIDR := strings.Contains(*targetPtr, "/")
+
+	config := Config{
+		Target:  *targetPtr,
+		Threads: *threadsPtr,
+		Timeout: time.Duration(*timeoutPtr) * time.Millisecond,
+		IsCIDR:  isCIDR,
+	}
+
+	if config.IsCIDR {
+		runHostDiscovery(config)
+	} else {
+		// Process Port Range only for Port Scan mode
+		start, end, err := parsePortRange(*rangePtr)
+		if err != nil {
+			fmt.Printf("Error parsing port range: %v\n", err)
+			return
+		}
+		config.StartPort = start
+		config.EndPort = end
+		runPortScan(config)
+	}
+}
+
+// --- HOST DISCOVERY LOGIC ---
+
+func runHostDiscovery(config Config) {
+	fmt.Printf("\nStarting Host Discovery against Subnet: %s\n", config.Target)
+	fmt.Printf("Strategy: TCP Probe on common ports (No Root Required)\n\n")
+
+	ips, err := hostsFromCIDR(config.Target)
 	if err != nil {
-		fmt.Printf("Error parsing port range: %v\n", err)
+		fmt.Printf("Error parsing CIDR: %v\n", err)
 		return
 	}
 
-	config := Config{
-		Target:    *targetPtr,
-		StartPort: startPort,
-		EndPort:   endPort,
-		Threads:   *threadsPtr,
-		Timeout:   time.Duration(*timeoutPtr) * time.Millisecond,
-	}
-
-	fmt.Printf("\nStarting Smart Scanner against %s (%d ports)\n", config.Target, endPort-startPort+1)
-	fmt.Printf("Mode: Active Service Detection\n\n")
-
-	// 3. Set up Concurrency
-	ports := make(chan int, config.Threads)
-	results := make(chan Result)
+	ipChan := make(chan string, config.Threads)
+	results := make(chan string)
 	var wg sync.WaitGroup
 
 	// Start Workers
 	for i := 0; i < config.Threads; i++ {
 		wg.Add(1)
-		go worker(ports, results, &wg, config)
+		go hostWorker(ipChan, results, &wg, config.Timeout)
 	}
 
-	// Send Ports to Workers
+	// Feed IPs
+	go func() {
+		for _, ip := range ips {
+			ipChan <- ip
+		}
+		close(ipChan)
+	}()
+
+	// Close results when done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect Results
+	var aliveHosts []string
+	for ip := range results {
+		aliveHosts = append(aliveHosts, ip)
+		fmt.Printf("[+] Host Up: %s\n", ip)
+	}
+
+	fmt.Printf("\n--- Discovery Complete ---\n")
+	fmt.Printf("Found %d live hosts.\n", len(aliveHosts))
+}
+
+func hostWorker(ips <-chan string, results chan<- string, wg *sync.WaitGroup, timeout time.Duration) {
+	defer wg.Done()
+	// Common ports to check for host availability (Ping Scan equivalent)
+	commonPorts := []int{80, 443, 22, 445, 135, 3389, 8080}
+
+	for ip := range ips {
+		if isHostUp(ip, commonPorts, timeout) {
+			results <- ip
+		}
+	}
+}
+
+func isHostUp(ip string, ports []int, timeout time.Duration) bool {
+	for _, port := range ports {
+		address := fmt.Sprintf("%s:%d", ip, port)
+		conn, err := net.DialTimeout("tcp", address, timeout)
+		if err == nil {
+			conn.Close()
+			return true // Found one open port, host is up
+		}
+	}
+	return false
+}
+
+func hostsFromCIDR(cidr string) ([]string, error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []string
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+		ips = append(ips, ip.String())
+	}
+	// Remove network address and broadcast address (usually first and last)
+	if len(ips) > 2 {
+		return ips[1 : len(ips)-1], nil
+	}
+	return ips, nil
+}
+
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+// --- PORT SCANNING LOGIC (Existing) ---
+
+func runPortScan(config Config) {
+	fmt.Printf("\nStarting Smart Service Scan against %s (%d ports)\n", config.Target, config.EndPort-config.StartPort+1)
+	fmt.Printf("Mode: Active Service Detection\n\n")
+
+	ports := make(chan int, config.Threads)
+	results := make(chan PortResult)
+	var wg sync.WaitGroup
+
+	for i := 0; i < config.Threads; i++ {
+		wg.Add(1)
+		go portWorker(ports, results, &wg, config)
+	}
+
 	go func() {
 		for p := config.StartPort; p <= config.EndPort; p++ {
 			ports <- p
@@ -75,28 +189,24 @@ func main() {
 		close(ports)
 	}()
 
-	// Close results channel when workers are done
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 4. Collect and Print Results
-	var openPorts []Result
+	var openPorts []PortResult
 	for res := range results {
 		if res.State == "Open" {
 			openPorts = append(openPorts, res)
-			// Live output
 			fmt.Printf("[+] Port %-5d : %-15s | %s\n", res.Port, res.Service, res.Banner)
 		}
 	}
 
-	// Summary
 	fmt.Println("\n--- Scan Complete ---")
 	sort.Slice(openPorts, func(i, j int) bool {
 		return openPorts[i].Port < openPorts[j].Port
 	})
-	
+
 	if len(openPorts) == 0 {
 		fmt.Println("No open ports found.")
 	} else {
@@ -104,8 +214,7 @@ func main() {
 	}
 }
 
-// worker processes ports from the channel
-func worker(ports <-chan int, results chan<- Result, wg *sync.WaitGroup, config Config) {
+func portWorker(ports <-chan int, results chan<- PortResult, wg *sync.WaitGroup, config Config) {
 	defer wg.Done()
 	for port := range ports {
 		res := scanPort(config.Target, port, config.Timeout)
@@ -115,21 +224,16 @@ func worker(ports <-chan int, results chan<- Result, wg *sync.WaitGroup, config 
 	}
 }
 
-// scanPort attempts to connect and detect the service
-func scanPort(target string, port int, timeout time.Duration) Result {
+func scanPort(target string, port int, timeout time.Duration) PortResult {
 	address := fmt.Sprintf("%s:%d", target, port)
-	
-	// 1. Initial TCP Connect
 	conn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
-		return Result{Port: port, State: "Closed"}
+		return PortResult{Port: port, State: "Closed"}
 	}
 	defer conn.Close()
 
-	// If we connected, the port is open. Now we detect the service.
 	service, banner := detectService(conn, target, port, timeout)
-
-	return Result{
+	return PortResult{
 		Port:    port,
 		State:   "Open",
 		Service: service,
@@ -137,101 +241,58 @@ func scanPort(target string, port int, timeout time.Duration) Result {
 	}
 }
 
-// detectService performs active probing to identify the protocol
 func detectService(conn net.Conn, target string, port int, timeout time.Duration) (string, string) {
-	// Set deadlines for I/O
 	conn.SetDeadline(time.Now().Add(timeout * 2))
 
-	// Strategy 1: Passive Listen (Banner Grabbing)
-	// Many protocols (SSH, FTP, SMTP) send a banner immediately upon connection.
-	// We wait briefly to see if the server speaks first.
+	// 1. Passive Listen
 	buffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)) 
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	n, err := conn.Read(buffer)
-	
+
 	var initialResponse string
 	if err == nil && n > 0 {
 		initialResponse = string(buffer[:n])
-		// Clean up newlines for display
 		cleanBanner := strings.TrimSpace(strings.ReplaceAll(initialResponse, "\n", " "))
 		if len(cleanBanner) > 50 {
 			cleanBanner = cleanBanner[:50] + "..."
 		}
-
-		// Check signatures based on initial banner
 		if strings.Contains(initialResponse, "SSH") {
 			return "SSH", cleanBanner
 		}
 		if strings.HasPrefix(initialResponse, "220") {
-			if strings.Contains(strings.ToLower(initialResponse), "ftp") {
-				return "FTP", cleanBanner
-			}
-			if strings.Contains(strings.ToLower(initialResponse), "smtp") || strings.Contains(initialResponse, "ESMTP") {
-				return "SMTP", cleanBanner
-			}
-			return "FTP/SMTP?", cleanBanner
+			return "FTP/SMTP", cleanBanner
 		}
-		if strings.HasPrefix(initialResponse, "RFB") {
-			return "VNC", cleanBanner
-		}
-		// If we got data but don't recognize it, return unknown with the data
 		return "Unknown (Chatty)", cleanBanner
 	}
 
-	// Strategy 2: Active Probing (Protocol Injection)
-	// If the server didn't speak (timeout or EOF), it's likely a "polite" protocol
-	// like HTTP, or it expects a specific handshake (TLS).
-
-	// Reset deadline for writing/reading
+	// 2. Active Probe (HTTP)
 	conn.SetDeadline(time.Now().Add(timeout))
-
-	// Probe A: Send a generic HTTP HEAD request
-	// This is the most common silent service.
 	httpRequest := fmt.Sprintf("HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n", target)
-	_, err = conn.Write([]byte(httpRequest))
-	if err == nil {
-		// Try to read response
-		n, err = conn.Read(buffer)
-		if err == nil && n > 0 {
-			response := string(buffer[:n])
-			if strings.Contains(response, "HTTP/") {
-				// Parse Server header if possible
-				serverHeader := extractHeader(response, "Server")
-				if serverHeader != "" {
-					return "HTTP", serverHeader
-				}
-				return "HTTP", "Web Server"
+	conn.Write([]byte(httpRequest))
+	n, err = conn.Read(buffer)
+	if err == nil && n > 0 {
+		response := string(buffer[:n])
+		if strings.Contains(response, "HTTP/") {
+			serverHeader := extractHeader(response, "Server")
+			if serverHeader != "" {
+				return "HTTP", serverHeader
 			}
+			return "HTTP", "Web Server"
 		}
 	}
 
-	// Strategy 3: TLS/SSL Probe
-	// If standard TCP failed to elicit a clear response, try a TLS handshake.
-	// We dial a NEW connection for this to ensure a clean state.
+	// 3. TLS Probe
 	address := fmt.Sprintf("%s:%d", target, port)
 	tlsConf := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS10}
 	tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", address, tlsConf)
 	if err == nil {
 		defer tlsConn.Close()
-		// If handshake succeeds, it is an SSL/TLS service (HTTPS, FTPS, IMAPS, etc.)
-		// We can try to write HTTP over TLS to see if it's HTTPS
-		tlsConn.Write([]byte(httpRequest))
-		tlsConn.SetReadDeadline(time.Now().Add(timeout))
-		n, err := tlsConn.Read(buffer)
-		if err == nil && n > 0 {
-			response := string(buffer[:n])
-			if strings.Contains(response, "HTTP/") {
-				return "HTTPS", "Secure Web Server"
-			}
-		}
 		return "SSL/TLS", "Encrypted Service"
 	}
 
-	// Default fallback
 	return "Unknown", "No Banner"
 }
 
-// Helper to extract headers from HTTP responses
 func extractHeader(response, headerName string) string {
 	lines := strings.Split(response, "\n")
 	for _, line := range lines {
@@ -242,7 +303,6 @@ func extractHeader(response, headerName string) string {
 	return ""
 }
 
-// Helper to parse "1-100" or "80"
 func parsePortRange(rangeStr string) (int, int, error) {
 	if strings.Contains(rangeStr, "-") {
 		parts := strings.Split(rangeStr, "-")
@@ -251,15 +311,22 @@ func parsePortRange(rangeStr string) (int, int, error) {
 		if err1 != nil || err2 != nil {
 			return 0, 0, fmt.Errorf("invalid range format")
 		}
-		if start > end {
-			return 0, 0, fmt.Errorf("start port cannot be greater than end port")
-		}
 		return start, end, nil
 	}
-	// Single port
 	p, err := strconv.Atoi(rangeStr)
-	if err != nil {
-		return 0, 0, err
+	return p, p, err
+}
+
+// Helper needed for CIDR parsing in some Go versions (generic binary encoding)
+func ipToInt(ip net.IP) uint32 {
+	if len(ip) == 16 {
+		return binary.BigEndian.Uint32(ip[12:16])
 	}
-	return p, p, nil
+	return binary.BigEndian.Uint32(ip)
+}
+
+func intToIP(nn uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, nn)
+	return ip
 }
